@@ -1,0 +1,140 @@
+import sys
+
+import usb.core
+import usb.util
+
+import usb.backend.libusb1
+from ctypes import c_void_p, c_int
+
+# Requires UsbDk to be installed (https://github.com/daynix/UsbDk)
+# Requires libusb-1.0.dll to be copied to C:\Windows\System32 (https://libusb.info/)
+
+_send_buffer = b""
+
+_usb_recv_ep = None
+_usb_send_ep = None
+
+USB_ENDPOINT_CMD_SEND = 0x01
+USB_ENDPOINT_CMD_RECV = 0x82
+
+supported_device_list = [
+  (0x0b4d, 0x1121),     # Silhouette Cameo
+  (0x0b4d, 0x1123),     # Silhouette Portrait
+  (0x0b4d, 0x1132),     # Silhouette Portrait 2
+  (0x0b4d, 0x113A),     # Silhouette Portrait 3
+
+  (0x0b4d, 0x1121),     # Silhouette Cameo
+  (0x0b4d, 0x112B),     # Silhouette Cameo 2
+  (0x0b4d, 0x112F),     # Silhouette Cameo 3
+  (0x0b4d, 0x1137)      # Silhouette Cameo 4
+]
+
+def send(data):
+    """
+    Queue up a series of bytes to send to the device. Follow with a call to
+    flush()
+    """
+    global _send_buffer
+
+    _send_buffer += data
+
+    print(len(_send_buffer))
+    
+def flush():
+    """
+    Ensure all outstanding commands have been sent. Blocks until complete.
+    """
+    global _send_buffer
+    global _usb_send_ep
+
+    total_written = 0
+
+    while _send_buffer:
+        written = _usb_send_ep.write(_send_buffer[:1024], timeout=0)
+        total_written += written
+        print("{} bytes written".format(total_written))
+        _send_buffer = _send_buffer[written:]    
+
+def receive(size=64, timeout=0):
+    """
+    Receive some data from the device. Returns a bytestring.
+    """
+    global _usb_recv_ep
+    data_array = _usb_recv_ep.read(size, timeout)
+    # NB: tobytes() was called tostring() in Python 2x. Here we try using
+    # the Python 3x name and fall back for Python 2x compatibility.
+    try:
+        return data_array.tobytes()
+    except AttributeError:
+        return data_array.tostring()
+
+def get_name():
+    """
+    Return the human-readable name and version reported by the device (as a string).
+    """
+    send(b"FG\x03")
+    flush()
+    return receive().rstrip(b" \x03").decode("utf-8")
+
+def open_silhouette_device():
+  global _usb_recv_ep
+  global _usb_send_ep
+
+  backend = usb.backend.libusb1.get_backend(find_library=lambda x: "libusb-1.0.dll")
+  backend.lib.libusb_set_option.argtypes = [c_void_p, c_int]
+  backend.lib.libusb_set_option(backend.ctx, 1)  # <--- this is the magic call to enable usbdk mode
+
+  for device in usb.core.find(find_all=True):
+      if (device.idVendor, device.idProduct) in supported_device_list:
+          config = device[0]
+          interface = config[(0, 0)]
+
+          # if device.is_kernel_driver_active(interface.bInterfaceNumber):
+          #     device.detach_kernel_driver(interface.bInterfaceNumber)
+
+          # device.reset()
+
+          device.set_configuration(1)
+
+          usb.util.claim_interface(device, interface)
+
+          _usb_send_ep = usb.util.find_descriptor(
+              interface,
+              bEndpointAddress=USB_ENDPOINT_CMD_SEND,
+          )
+          _usb_recv_ep = usb.util.find_descriptor(
+              interface,
+              bEndpointAddress=USB_ENDPOINT_CMD_RECV,
+          )
+        
+          return device
+  return None
+
+if len(sys.argv)==2:
+  f = open(sys.argv[1], 'rb')
+elif len(sys.argv)==1:
+  f = sys.stdin
+else:
+  print('Usage: file2silhouette [filename]')
+  sys.exit(1)
+
+dev = open_silhouette_device()
+
+if not dev:
+  sys.stderr.write('No silhouette device found\n')
+  sys.exit(1)
+
+print("Device name: '{}'".format(get_name()))
+print("Sending data")
+
+while True:
+  data = f.read(1024)
+  if not data:
+    break
+  send(data)
+f.close()
+
+print("Flushing. Length = {}".format(len(_send_buffer)))
+flush()
+
+print("Done")
